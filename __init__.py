@@ -1,7 +1,7 @@
 import logging
 import sys
 import os
-from typing import Dict, Tuple
+from typing import Dict
 # Copied and modified from NeuroSenko/ComfyUI_LLM_SDXL_Adapter
 # Setup logging
 logger = logging.getLogger("JinaCLIP-SDXL-Adapter")
@@ -29,7 +29,6 @@ try:
     logger.info("All required dependencies found")
 except ImportError as e:
     logger.error(f"Missing dependency: {e}")
-    logger
 # Import all node modules from separate files
 try:
     from .jina_clip_v2_nodes import NODE_CLASS_MAPPINGS as JINA_CLIP_V2_MAPPINGS
@@ -37,6 +36,9 @@ try:
 
     from .jina_clip_v2_advanced_nodes import NODE_CLASS_MAPPINGS as JINA_CLIP_V2_ADVANCED_MAPPINGS
     from .jina_clip_v2_advanced_nodes import NODE_DISPLAY_NAME_MAPPINGS as JINA_CLIP_V2_ADVANCED_DISPLAY_MAPPINGS
+
+    from .jina_load_lora import NODE_CLASS_MAPPINGS as JINA_ADAPTER_LORA_MAPPINGS
+    from .jina_load_lora import NODE_DISPLAY_NAME_MAPPINGS as JINA_ADAPTER_LORA_DISPLAY_MAPPINGS
 
     logger.info("Successfully imported all node modules from separate files")
     
@@ -52,10 +54,12 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {}
 all_class_mappings = [
     JINA_CLIP_V2_MAPPINGS,
     JINA_CLIP_V2_ADVANCED_MAPPINGS,
+    JINA_ADAPTER_LORA_MAPPINGS,
 ]
 all_display_mappings = [
     JINA_CLIP_V2_DISPLAY_MAPPINGS,
     JINA_CLIP_V2_ADVANCED_DISPLAY_MAPPINGS,
+    JINA_ADAPTER_LORA_DISPLAY_MAPPINGS,
 ]
 
 for mapping in all_class_mappings:

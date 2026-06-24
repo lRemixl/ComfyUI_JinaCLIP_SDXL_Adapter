@@ -151,7 +151,8 @@ class JinaToSDXLAdapterV2(nn.Module):
                  num_heads=16,
                  dropout=0,
                  max_seq_len=539,
-                 attn_pooling=True):
+                 attn_pooling=True,
+                 use_positional=True):
         super().__init__()
         self.attn_pooling = attn_pooling
 
@@ -163,7 +164,9 @@ class JinaToSDXLAdapterV2(nn.Module):
             nn.Linear(sdxl_seq_dim, sdxl_seq_dim)
         )
 
-        self.positional_embedding = nn.Embedding(max_seq_len, sdxl_seq_dim)
+        self.use_positional = use_positional
+        if self.use_positional:
+            self.positional_embedding = nn.Embedding(max_seq_len, sdxl_seq_dim)
 
         self.attention_blocks = nn.ModuleList([
             TransformerBlock(sdxl_seq_dim, num_heads=num_heads, mlp_ratio=4.0, dropout=dropout)
@@ -192,9 +195,10 @@ class JinaToSDXLAdapterV2(nn.Module):
         # Map 1024 -> 2048
         hidden_states = self.seq_projection(jina_hidden_states)
 
-        seq_len = hidden_states.size(1)
-        positions = torch.arange(seq_len, device=hidden_states.device)
-        hidden_states = hidden_states + self.positional_embedding(positions).unsqueeze(0)
+        if self.use_positional:
+            seq_len = hidden_states.size(1)
+            positions = torch.arange(seq_len, device=hidden_states.device)
+            hidden_states = hidden_states + self.positional_embedding(positions).unsqueeze(0)
 
         # attention layers
         for block in self.attention_blocks:

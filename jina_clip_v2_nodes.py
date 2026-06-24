@@ -3,16 +3,18 @@ import logging
 import gc
 import os
 import sys
-import types
 import re
-from typing import List, Dict
+import math
 from transformers import AutoTokenizer, AutoModel
 from safetensors.torch import load_file
 
 from .utils import get_llm_checkpoints, get_llm_checkpoint_path, get_llm_adapters, get_llm_adapter_path
 from .jina_to_sdxl_adapter_v2 import JinaToSDXLAdapterV2
+from .jina_attention_mask import build_conditioning, install_cross_attention_mask_patch
 
 logger = logging.getLogger("JinaCLIP-SDXL-Adapter")
+
+install_cross_attention_mask_patch()
 
 def ensure_flash_attn_bypass():
     """
@@ -27,7 +29,7 @@ def ensure_flash_attn_bypass():
         pass
     logger.warning("Removing Flash-attention, can't import apply_rotary. Jina-clip-v2 will FAIL crash ComfyUI if this is not done.")
     # Delete flash-attn from sys.modules
-    keys_to_delete =[k for k in sys.modules if k.startswith("flash_attn")]
+    keys_to_delete = [k for k in sys.modules if k.startswith("flash_attn")]
     for k in keys_to_delete:
         del sys.modules[k]
     return
@@ -40,7 +42,7 @@ class JinaStates:
                  model_id: str,
                  device: str = "cpu",
                  dtype: torch.dtype = torch.bfloat16,
-                 max_length: int = 512):
+                 max_length: int = 1024):
 
         self.max_length = max_length
         self.device = device
@@ -170,7 +172,7 @@ class JinaClipLoader:
                     model_id=model_path,
                     device=device,
                     dtype=weight_dtype,
-                    max_length=512
+                    max_length=1024
                 )
 
                 self.current_model_path = model_path
@@ -191,6 +193,7 @@ class JinaAdapterLoader:
         self.current_adapter_path = None
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.current_attn_pooling = None
+        self.current_use_positional = None
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -211,13 +214,13 @@ class JinaAdapterLoader:
     CATEGORY = "llm_sdxl/jina"
     
     def load_adapter(self, adapter_name, device="auto", force_reload=False):
-        
+        use_positional_embeddings=False
         if device == "auto":
             device = self.device
         adapter_path = get_llm_adapter_path(adapter_name)
 
         try:
-            if force_reload or self.adapter is None or self.current_adapter_path != adapter_path or self.current_attn_pooling != attn_pooling:
+            if force_reload or self.adapter is None or self.current_adapter_path != adapter_path or self.current_use_positional != use_positional_embeddings:
                 if self.adapter is not None:
                     del self.adapter
                     gc.collect()
@@ -232,8 +235,9 @@ class JinaAdapterLoader:
                     n_attention_blocks=4,
                     num_heads=16,
                     dropout=0,
-                    max_seq_len=539, # Nearest multiple of 77 to 512. Found out that the adapter doesn't have to output embeddings with a sequence length of a multiple of 77. I had sage-attention cuda enabled which was causing black images when it wasn't.
-                    attn_pooling=True) 
+                    max_seq_len=1078,
+                    attn_pooling=True,
+                    use_positional=use_positional_embeddings)
 
                 if os.path.exists(adapter_path):
                     checkpoint = load_file(adapter_path)
@@ -245,9 +249,11 @@ class JinaAdapterLoader:
                 self.adapter.to(device)
                 self.adapter.eval()
                 self.current_adapter_path = adapter_path
+                self.current_attn_pooling = True
+                self.current_use_positional = use_positional_embeddings
                 logger.info("Jina Adapter loaded successfully")
 
-            info = f"Adapter: {adapter_path}\nDevice: {device}"
+            info = f"Adapter: {adapter_path}\nDevice: {device}\nPositional embeddings: {use_positional_embeddings}"
             return (self.adapter, info)
 
         except Exception as e:
@@ -265,7 +271,8 @@ class JinaTextEncoder:
                 "jina_model": ("JINA_MODEL",),
                 "jina_adapter": ("JINA_ADAPTER",),
                 "text": ("STRING", {"multiline": True, "default": "masterpiece, (best quality:1.2)"}),
-                "Padding_Mode": (["none", "Nearest-77", "539"], {"default": "Nearest-77"}),
+                "Padding_Mode": (["none", "Nearest-77", "539", "1078"], {"default": "Nearest-77"}),
+                "cross_attention_mask": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -341,16 +348,68 @@ class JinaTextEncoder:
 
         return "".join(out_text), out_weights
 
-    def get_token_data(self, tokenizer, clean_text, char_weights, device, do_pad):
-        import math
+    def get_padding_target(self, seq_len, do_pad):
+        if do_pad == "none":
+            return seq_len, ""
 
+        if do_pad == "539":
+            target_len = 539
+            info_str = f"Original token length: {seq_len}, adapter padded to {target_len} Tokens"
+        elif do_pad == "1078":
+            target_len = 1078
+            info_str = f"Original token length: {seq_len}, adapter padded to {target_len} Tokens"
+        else:
+            target_len = math.ceil(seq_len / 77) * 77
+            info_str = f"Original token length: {seq_len}, adapter padded to nearest multiple of 77: {target_len} Tokens"
+
+        if target_len < seq_len:
+            info_str += f" (padding target is shorter than token length; using {seq_len})"
+            target_len = seq_len
+
+        return target_len, info_str
+
+    def resize_adapter_inputs(self, hidden_states, attention_mask, target_len, token_weights=None):
+        seq_len = hidden_states.shape[1]
+
+        if seq_len > target_len:
+            hidden_states = hidden_states[:, :target_len, :]
+            attention_mask = attention_mask[:, :target_len]
+            if token_weights is not None:
+                token_weights = token_weights[:target_len]
+            return hidden_states, attention_mask, token_weights
+
+        if seq_len < target_len:
+            pad_len = target_len - seq_len
+            hidden_pad = torch.zeros(
+                hidden_states.shape[0],
+                pad_len,
+                hidden_states.shape[2],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            mask_pad = torch.zeros(
+                attention_mask.shape[0],
+                pad_len,
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            hidden_states = torch.cat([hidden_states, hidden_pad], dim=1)
+            attention_mask = torch.cat([attention_mask, mask_pad], dim=1)
+
+            if token_weights is not None:
+                weight_pad = torch.ones(pad_len, dtype=token_weights.dtype, device=token_weights.device)
+                token_weights = torch.cat([token_weights, weight_pad])
+
+        return hidden_states, attention_mask, token_weights
+
+    def get_token_data(self, tokenizer, clean_text, char_weights, device, do_pad, max_length):
         inputs = tokenizer(
             clean_text,
             return_tensors="pt",
             padding=False,
             truncation=True,
-            max_length=512,
-            return_offsets_mapping=True
+            max_length=max_length,
+            return_offsets_mapping=True,
         )
 
         input_ids = inputs.input_ids[0].to(device)
@@ -360,111 +419,57 @@ class JinaTextEncoder:
         seq_len = input_ids.shape[0]
         token_weights = torch.ones(seq_len, dtype=torch.float32, device=device)
 
-        for t_idx in range(seq_len):
-            start, end = int(offset_mapping[t_idx][0].item()), int(offset_mapping[t_idx][1].item())
-            if start == end: continue # for special tokens 
+        for token_index in range(seq_len):
+            start = int(offset_mapping[token_index][0].item())
+            end = int(offset_mapping[token_index][1].item())
+            if start == end:
+                continue
 
             if start < len(char_weights) and end <= len(char_weights):
                 segment_weights = char_weights[start:end]
                 if segment_weights:
-                    token_weights[t_idx] = sum(segment_weights) / len(segment_weights)
-        info_str = ""                
+                    token_weights[token_index] = sum(segment_weights) / len(segment_weights)
 
-        if do_pad != "none":
-            
-            # Pad sequence to nearest multiple of 77 to prevent black images
-            # (Sage attention cuda was causing the black images when not using multiple of 77. Not actually needed, hence "none" mode)
-            # However does provide better performance still. So still enabled by default.
+        target_len, info_str = self.get_padding_target(seq_len, do_pad)
+        return input_ids.unsqueeze(0), attention_mask.unsqueeze(0), token_weights, target_len, info_str
 
-            target_len = math.ceil(seq_len / 77) * 77
-
-            info_str = f"Original token length: {seq_len}, Padded to nearest mutliple of 77: {target_len} Tokens"
-
-            if do_pad == "539":
-                target_len = 539
-                info_str = f"Original token length: {seq_len}, Padded to {target_len} Tokens"
-            pad_len = target_len - seq_len
-
-            if pad_len > 0:
-                pad_token_id = tokenizer.pad_token_id
-                if pad_token_id is None:
-                    pad_token_id = tokenizer.eos_token_id or 0
-
-                pad_ids = torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype, device=device)
-                pad_mask = torch.zeros((pad_len,), dtype=attention_mask.dtype, device=device)
-                pad_weights = torch.ones((pad_len,), dtype=token_weights.dtype, device=device)
-
-                input_ids = torch.cat([input_ids, pad_ids])
-                attention_mask = torch.cat([attention_mask, pad_mask])
-                token_weights = torch.cat([token_weights, pad_weights])
-
-        return input_ids.unsqueeze(0), attention_mask.unsqueeze(0), token_weights, info_str
-
-    def encode(self, jina_model, jina_adapter, text, Padding_Mode="Nearest-77"):
-
-        Padding_Mode = "none" if "worst quality" in text.lower() else Padding_Mode
+    def encode(self, jina_model, jina_adapter, text, Padding_Mode="Nearest-77", cross_attention_mask=True):
         weighting_mode = "comfy"
-        custom_dtype="auto"
-        format_text=True
+        custom_dtype = torch.float32
+        format_text = False
 
         if format_text:
-            # Match @ tags explicitly occurring at start of string, after comma, or after newline 
-            # (ignoring any leading spaces for the tag itself)
             pattern = r'(^|,|\n)\s*(@[^,\.\n]+)'
             extracted_tags = []
-            
+
             def extract_tag(match):
                 prefix = match.group(1)
-                tag_content = match.group(2)
-                
-                # Strip excessive whitespace inside the tags and ensure exactly 1 space right after @
-                tag_content = re.sub(r'\s+', ' ', tag_content.strip())
-                formatted_tag = re.sub(r'^@\s*', '@ ', tag_content)
-                extracted_tags.append(formatted_tag)
-                
-                # Keep newlines to prevent structural collapse, but mark commas/starts for removal
+                tag_content = re.sub(r'\s+', ' ', match.group(2).strip())
+                extracted_tags.append(re.sub(r'^@\s*', '@ ', tag_content))
                 return '\n' if prefix == '\n' else ''
-            
-            clean_string = text
-            clean_string = re.sub(pattern, extract_tag, clean_string)
-            
-            # --- Cleanup lingering formatting fragments ---
-            # Collapse duplicate commas left behind
+
+            clean_string = re.sub(pattern, extract_tag, text)
             clean_string = re.sub(r'(,\s*){2,}', ', ', clean_string)
-            # Remove isolated commas/spaces occurring at the start or immediately after a newline
             clean_string = re.sub(r'(^|\n)[ \t,]+', r'\1', clean_string)
-            # Remove isolated commas/spaces occurring at the end or immediately before a newline
             clean_string = re.sub(r'[ \t,]+($|\n)', r'\1', clean_string)
-            
-            # Prepend matching queries
+
             if extracted_tags:
                 prefix_str = ", ".join(extracted_tags)
-                if clean_string:
-                    text = prefix_str + ", " + clean_string
-                else:
-                    text = prefix_str
-
-
-        if custom_dtype == "auto":
-            custom_dtype = torch.float32
-        elif custom_dtype == "fp16":
-            custom_dtype=torch.float16
-        elif custom_dtype == "bf16":
-            custom_dtype=torch.bfloat16
-        elif custom_dtype == "fp32":
-            custom_dtype=torch.float32
-        
-        do_pad_77 = Padding_Mode
+                text = f"{prefix_str}, {clean_string}" if clean_string else prefix_str
 
         try:
             device = jina_model.device
             clean_text, char_weights = self.parse_weights(text)
-
-            input_ids, attention_mask, token_weights, info_str = self.get_token_data(
-                jina_model.tokenizer, clean_text, char_weights, device, do_pad=do_pad_77
+            max_length = getattr(jina_model, "max_length", 1024)
+            input_ids, attention_mask, token_weights, target_len, info_str = self.get_token_data(
+                jina_model.tokenizer,
+                clean_text,
+                char_weights,
+                device,
+                do_pad=Padding_Mode,
+                max_length=max_length,
             )
 
-            # Helper for Jina-clip-v2's forward pass
             def run_jina_states(ids, mask):
                 with torch.no_grad():
                     jina_model.hidden_states_cache = None
@@ -481,55 +486,39 @@ class JinaTextEncoder:
                         else:
                             pooled = out
 
-                    # use mean-pooling fallback check
                     if not isinstance(pooled, torch.Tensor):
                         pooled = jina_model.mean_pooling(jina_model.hidden_states_cache, mask)
 
-                    # prevent Jina's hook from overwriting the references across runs
                     return jina_model.hidden_states_cache.clone().to(custom_dtype), pooled.clone().to(custom_dtype)
 
             with torch.no_grad():
                 empty_prompt_embeds = None
                 if weighting_mode == "comfy":
-                    # Pre-calculate baseline
                     empty_inputs = jina_model.tokenizer("", return_tensors="pt")
                     e_ids = empty_inputs.input_ids.to(device)
                     e_mask = empty_inputs.attention_mask.to(device)
-
-                    seq_len = input_ids.shape[1]
-                    pad_len = seq_len - e_ids.shape[1]
-
-                    # align empty sequence length to the prompt sequence length
-                    if pad_len > 0:
-                        pad_token_id = jina_model.tokenizer.pad_token_id or 0
-                        pad_ids = torch.full((1, pad_len), pad_token_id, dtype=e_ids.dtype, device=device)
-                        pad_mask = torch.zeros((1, pad_len), dtype=e_mask.dtype, device=device)
-                        e_ids = torch.cat([e_ids, pad_ids], dim=1)
-                        e_mask = torch.cat([e_mask, pad_mask], dim=1)
-                    elif pad_len < 0:
-                        e_ids = e_ids[:, :seq_len]
-                        e_mask = e_mask[:, :seq_len]
-
-                    # Process empty baseline string through the text encoder + adapter 
                     e_hidden, e_pooled = run_jina_states(e_ids, e_mask)
+                    e_hidden, e_adapter_mask, _ = self.resize_adapter_inputs(e_hidden, e_mask, target_len)
                     empty_prompt_embeds, _ = jina_adapter(
-                        e_hidden.to(torch.float32), 
-                        e_pooled.to(torch.float32), 
-                        e_mask.to(torch.float32)
+                        e_hidden.to(torch.float32),
+                        e_pooled.to(torch.float32),
+                        e_adapter_mask.to(torch.float32),
                     )
 
-                # Process prompt through the text encoder + adapter 
                 base_hidden, base_pooled = run_jina_states(input_ids, attention_mask)
+                adapter_hidden, adapter_mask, token_weights = self.resize_adapter_inputs(
+                    base_hidden,
+                    attention_mask,
+                    target_len,
+                    token_weights,
+                )
                 prompt_embeds, final_pooled = jina_adapter(
-                    base_hidden.to(torch.float32), 
-                    base_pooled.to(torch.float32), 
-                    attention_mask.to(torch.float32)
+                    adapter_hidden.to(torch.float32),
+                    base_pooled.to(torch.float32),
+                    adapter_mask.to(torch.float32),
                 )
 
-                # mapped to adapter output sequence length
                 w_tensor = token_weights.unsqueeze(0).unsqueeze(-1).to(prompt_embeds.device)
-
-                # Apply weighting to the adapter's output prompt embedding
                 if len(char_weights) > 0:
                     diff = prompt_embeds - empty_prompt_embeds
                     prompt_embeds = empty_prompt_embeds + (diff * w_tensor)
@@ -537,9 +526,14 @@ class JinaTextEncoder:
             prompt_embeds = prompt_embeds.to(custom_dtype).cpu().contiguous()
             final_pooled = final_pooled.to(custom_dtype).cpu().contiguous()
 
-            conditioning = [[prompt_embeds, {"pooled_output": final_pooled}]]
-
-            info_str = info_str + f"\nprompt_embeds shape: {prompt_embeds.shape}"
+            conditioning, mask_info = build_conditioning(
+                prompt_embeds,
+                final_pooled,
+                adapter_mask,
+                cross_attention_mask,
+            )
+            info_str = info_str + f"\nJina model sequence length: {input_ids.shape[1]}"
+            info_str = info_str + f"\nprompt_embeds shape: {prompt_embeds.shape}{mask_info}"
 
             return (conditioning, info_str)
 
