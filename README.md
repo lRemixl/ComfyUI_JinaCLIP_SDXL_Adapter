@@ -15,7 +15,10 @@ ComfyUI nodes for use with [Jina-clip-v2 adapter](https://huggingface.co/TheRemi
 
 **Advanced nodes**:
 - Advanced nodes included for testing.
-
+- Initial release on the adapter needs to be loaded with the advanced node. With settings:
+  - Positional embeddings: true
+  - max_seq_length: 539
+  - attn_pooling: true 
 Credits:
 NeuroSenko: Uses their [custom nodes](https://github.com/NeuroSenko/ComfyUI_LLM_SDXL_Adapter/) as a base 
 ****
